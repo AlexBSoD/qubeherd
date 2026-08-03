@@ -27,6 +27,9 @@ from pathlib import Path
 PACKET_TYPE = 0xB0
 PACKET_VERSION = 0x01
 PACKET_LEN = 32
+# The header clock uses the same host-data channel. Entropy sends this too, but
+# only while its GUI runs — and the screen shows "--:--" until somebody does.
+CLOCK_PACKET_TYPE = 0xAA
 # Agent states, in the order the firmware reads them out of the packet.
 STATES = ("working", "idle", "blocked", "done", "unknown")
 
@@ -107,6 +110,14 @@ def build_packet(counts: dict[str, int]) -> bytes:
     return bytes(payload)
 
 
+def build_clock_packet(hour: int, minute: int) -> bytes:
+    payload = bytearray(PACKET_LEN)
+    payload[0] = CLOCK_PACKET_TYPE
+    payload[1] = hour
+    payload[2] = minute
+    return bytes(payload)
+
+
 def find_raw_hid_device() -> Path | None:
     """Locate the keyboard's raw-HID node by walking sysfs.
 
@@ -178,17 +189,22 @@ def default_socket_path() -> Path:
     return Path(config_home) / "herdr" / "herdr.sock"
 
 
-def run(socket_path: Path, once: bool) -> int:
+def run(socket_path: Path, once: bool, clock: bool) -> int:
     client = HerdrClient(socket_path)
     writer = QubeWriter()
 
     if once:
         counts = summarize(client.call("agent.list").get("agents", []))
         log.info("agents: %s", counts)
-        return 0 if writer.write(build_packet(counts)) else 1
+        sent = writer.write(build_packet(counts))
+        if clock:
+            local = time.localtime()
+            sent = writer.write(build_clock_packet(local.tm_hour, local.tm_min)) and sent
+        return 0 if sent else 1
 
     backoff = RECONNECT_MIN_SECONDS
     last_counts: dict[str, int] | None = None
+    last_clock: tuple[int, int] | None = None
     last_sent = time.monotonic() - HEARTBEAT_SECONDS
     while True:
         try:
@@ -234,6 +250,19 @@ def run(socket_path: Path, once: bool) -> int:
                             deadline = min(deadline, now + DEBOUNCE_SECONDS)
                         continue
 
+                    # The firmware keeps the clock until something replaces it,
+                    # so this only needs to fire when the minute rolls over —
+                    # or after a reopen, where the dongle has forgotten it.
+                    if clock:
+                        local = time.localtime()
+                        # `device is None` means the next write reopens the
+                        # dongle, which by then has lost the time we set.
+                        if (local.tm_hour, local.tm_min) != last_clock or writer.device is None:
+                            if writer.write(build_clock_packet(local.tm_hour, local.tm_min)):
+                                last_clock = (local.tm_hour, local.tm_min)
+                            else:
+                                last_clock = None
+
                     counts = summarize(client.call("agent.list").get("agents", []))
                     now = time.monotonic()
                     # herdr emits pane.updated for scrolling and resizes too,
@@ -272,6 +301,12 @@ def main() -> int:
         help="send a single packet from the current agent list and exit",
     )
     parser.add_argument("--verbose", action="store_true", help="log every packet")
+    parser.add_argument(
+        "--no-clock",
+        dest="clock",
+        action="store_false",
+        help="leave the header clock to Entropy instead of sending it",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -279,7 +314,7 @@ def main() -> int:
         format="%(levelname)s %(message)s",
     )
     try:
-        return run(args.socket, args.once)
+        return run(args.socket, args.once, args.clock)
     except KeyboardInterrupt:
         return 0
 

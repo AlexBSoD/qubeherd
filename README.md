@@ -66,6 +66,10 @@ As a home-manager module:
   sent when the counts change or the heartbeat comes due.
 - **Reconnects with backoff** (1 s → 30 s) if herdr restarts, and reopens the
   HID node if the dongle is unplugged and plugged back in.
+- **Sends the header clock too** (packet `0xAA`, on every minute rollover and
+  after reopening the dongle). Entropy sends the same packet, but only while
+  its GUI is running — without either, the header sits at `--:--`. Pass
+  `--no-clock` to leave the clock to Entropy.
 
 ## Wire format
 
