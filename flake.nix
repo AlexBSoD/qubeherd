@@ -14,21 +14,28 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        qubeherd = pkgs.stdenvNoCC.mkDerivation {
+        qubeherd = pkgs.rustPlatform.buildRustPackage {
           pname = "qubeherd";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
-          installPhase = ''
-            install -Dm755 qubeherd.py $out/bin/qubeherd
-            substituteInPlace $out/bin/qubeherd \
-              --replace-fail '#!/usr/bin/env python3' '#!${pkgs.python3}/bin/python3'
-          '';
+          cargoLock.lockFile = ./Cargo.lock;
           meta = {
-            description = "Push herdr agent-state counts to an Ergohaven Qube dongle";
+            description = "Push herdr agent state, host clock and keyboard layout to an Ergohaven Qube dongle";
             mainProgram = "qubeherd";
           };
         };
         default = qubeherd;
+      });
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+          ];
+        };
       });
 
       homeModules.default =

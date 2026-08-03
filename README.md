@@ -36,14 +36,17 @@ keyboard firmware, which renders it as the middle panel of the dongle UI:
 ## Usage
 
 ```console
-$ qubeherd --once --verbose      # send one packet from the current state, exit
-INFO agents: {'working': 1, 'idle': 2, 'blocked': 0, 'done': 0, 'unknown': 0}
-INFO writing agent status to /dev/hidraw3
+$ qubeherd --once --verbose      # push the current state once, then exit
+[INFO ] writing to /dev/hidraw3
+[INFO ] layout: ru
+[INFO ] agents: 1 working, 2 idle, 0 blocked, 0 done, 0 unknown
 
 $ qubeherd                       # stay running
+$ nix run .                      # …or straight from the flake
 ```
 
-As a home-manager module:
+Build it with `cargo build --release`, or `nix develop` for a shell with the
+toolchain. As a home-manager module:
 
 ```nix
 {
@@ -71,12 +74,16 @@ As a home-manager module:
   its GUI is running — without either, the header sits at `--:--`. Pass
   `--no-clock` to leave the clock to Entropy.
 - **Syncs the host keyboard layout** (packet `0xAC`), following KDE's
-  `org.kde.KeyboardLayouts` D-Bus signal via `busctl`. This one is not
-  cosmetic: Universal Symbols resolve their keycodes against the layout the
-  firmware believes is active, so without it the keyboard types the wrong
-  characters. Resent every 60 s and after a reopen, since nothing expires it
-  on the firmware side. `--no-layout` opts out; on non-KDE sessions the
-  daemon logs a warning and carries on without it.
+  `org.kde.KeyboardLayouts` D-Bus signal. This one is not cosmetic: Universal
+  Symbols resolve their keycodes against the layout the firmware believes is
+  active, so without it the keyboard types the wrong characters — see
+  [ergohaven/entropy#140](https://github.com/ergohaven/entropy/issues/140).
+  `--no-layout` opts out; non-KDE sessions warn once and carry on.
+- **Replays clock and layout on every (re)open of the device.** A keyboard
+  that just rebooted starts from `HostLayout::English` and an empty clock, and
+  nothing on the firmware side expires either — so a reflash or a replug would
+  otherwise leave Universal Symbols wrong until the next layout switch. The
+  layout is also refreshed every 10 s as a backstop against a lost packet.
 
 ## Wire format
 
