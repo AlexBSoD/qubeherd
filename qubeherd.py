@@ -19,6 +19,7 @@ import os
 import re
 import select
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,15 @@ PACKET_LEN = 32
 # The header clock uses the same host-data channel. Entropy sends this too, but
 # only while its GUI runs — and the screen shows "--:--" until somebody does.
 CLOCK_PACKET_TYPE = 0xAA
+# Universal Symbols resolve keycodes against the host's active layout. Without
+# this packet the firmware keeps its own stale idea of it and types the wrong
+# characters, so this is a correctness fix, not decoration.
+LAYOUT_PACKET_TYPE = 0xAC
+# Layout codes the firmware understands (universal_symbols::HostLayout).
+LAYOUT_CODES = ("en", "ru")
+# Re-send the layout this often even when nothing changed: unlike the agent
+# counts it never expires, so a single lost packet would be silent and lasting.
+LAYOUT_REFRESH_SECONDS = 60.0
 # Agent states, in the order the firmware reads them out of the packet.
 STATES = ("working", "idle", "blocked", "done", "unknown")
 
@@ -118,6 +128,122 @@ def build_clock_packet(hour: int, minute: int) -> bytes:
     return bytes(payload)
 
 
+def build_layout_packet(code: int) -> bytes:
+    payload = bytearray(PACKET_LEN)
+    payload[0] = LAYOUT_PACKET_TYPE
+    payload[1] = code
+    return bytes(payload)
+
+
+def normalize_layout(xkb_name: str) -> int | None:
+    """Map an xkb layout name onto the firmware's layout code."""
+    name = re.split(r"[-_.:(@]", xkb_name.strip())[0].lower()
+    if name in ("en", "us", "gb", "uk", "au", "ca"):
+        return LAYOUT_CODES.index("en")
+    if name.startswith("russian") or name == "ru":
+        return LAYOUT_CODES.index("ru")
+    return None
+
+
+class KdeLayoutSource:
+    """Follows the active keyboard layout via KDE's D-Bus interface.
+
+    Uses `busctl` rather than a D-Bus binding to keep this daemon on the
+    standard library; `busctl monitor --json=short` emits one JSON object per
+    signal, which is all the parsing this needs.
+    """
+
+    SERVICE = ("org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts")
+
+    def __init__(self) -> None:
+        self.monitor: subprocess.Popen[str] | None = None
+        self.names: list[str] = []
+
+    def _call(self, member: str) -> str | None:
+        service, path, interface = self.SERVICE
+        try:
+            result = subprocess.run(
+                ["busctl", "--user", "call", service, path, interface, member],
+                capture_output=True,
+                text=True,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            log.debug("busctl %s failed: %s", member, err)
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def available(self) -> bool:
+        return self._call("getLayout") is not None
+
+    def _refresh_names(self) -> None:
+        # Reply looks like: a(sss) 2 "us" "" "English (US)" "ru" "" "Russian"
+        reply = self._call("getLayoutsList")
+        if reply is None:
+            return
+        quoted = re.findall(r'"([^"]*)"', reply)
+        self.names = quoted[::3]
+
+    def code_for_index(self, index: int) -> int | None:
+        if index >= len(self.names):
+            self._refresh_names()
+        if index >= len(self.names):
+            return None
+        return normalize_layout(self.names[index])
+
+    def current(self) -> int | None:
+        reply = self._call("getLayout")
+        if reply is None:
+            return None
+        match = re.search(r"\bu\s+(\d+)", reply)
+        return self.code_for_index(int(match.group(1))) if match else None
+
+    def start_monitor(self) -> None:
+        _, _, interface = self.SERVICE
+        self.monitor = subprocess.Popen(
+            [
+                "busctl",
+                "--user",
+                "monitor",
+                "--json=short",
+                # A positional argument here would be read as a service name.
+                f"--match=type='signal',interface='{interface}'",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+    def fileno(self) -> int | None:
+        if self.monitor is None or self.monitor.stdout is None:
+            return None
+        return self.monitor.stdout.fileno()
+
+    def read_signal(self) -> int | None:
+        """Consume one signal line; returns the new layout code, if any."""
+        if self.monitor is None or self.monitor.stdout is None:
+            return None
+        line = self.monitor.stdout.readline()
+        if not line:
+            raise ConnectionError("busctl monitor exited")
+        try:
+            signal = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if signal.get("member") == "layoutListChanged":
+            self._refresh_names()
+            return self.current()
+        if signal.get("member") != "layoutChanged":
+            return None
+        data = signal.get("payload", {}).get("data") or []
+        return self.code_for_index(int(data[0])) if data else None
+
+    def close(self) -> None:
+        if self.monitor is not None:
+            self.monitor.terminate()
+            self.monitor = None
+
+
 def find_raw_hid_device() -> Path | None:
     """Locate the keyboard's raw-HID node by walking sysfs.
 
@@ -189,9 +315,13 @@ def default_socket_path() -> Path:
     return Path(config_home) / "herdr" / "herdr.sock"
 
 
-def run(socket_path: Path, once: bool, clock: bool) -> int:
+def run(socket_path: Path, once: bool, clock: bool, layout: bool) -> int:
     client = HerdrClient(socket_path)
     writer = QubeWriter()
+    layouts = KdeLayoutSource() if layout else None
+    if layouts is not None and not layouts.available():
+        log.warning("no KDE layout service on the bus; Universal Symbols will not be synced")
+        layouts = None
 
     if once:
         counts = summarize(client.call("agent.list").get("agents", []))
@@ -200,12 +330,21 @@ def run(socket_path: Path, once: bool, clock: bool) -> int:
         if clock:
             local = time.localtime()
             sent = writer.write(build_clock_packet(local.tm_hour, local.tm_min)) and sent
+        if layouts is not None:
+            code = layouts.current()
+            if code is not None:
+                log.info("layout: %s", LAYOUT_CODES[code])
+                sent = writer.write(build_layout_packet(code)) and sent
         return 0 if sent else 1
 
     backoff = RECONNECT_MIN_SECONDS
     last_counts: dict[str, int] | None = None
     last_clock: tuple[int, int] | None = None
+    last_layout: int | None = None
+    last_layout_sent = 0.0
     last_sent = time.monotonic() - HEARTBEAT_SECONDS
+    if layouts is not None:
+        layouts.start_monitor()
     while True:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as events:
@@ -235,8 +374,21 @@ def run(socket_path: Path, once: bool, clock: bool) -> int:
                 while True:
                     now = time.monotonic()
                     timeout = max(0.0, deadline - now)
-                    readable, _, _ = select.select([events], [], [], timeout)
-                    if readable:
+                    layout_fd = layouts.fileno() if layouts is not None else None
+                    watched = [events] + ([layout_fd] if layout_fd is not None else [])
+                    readable, _, _ = select.select(watched, [], [], timeout)
+
+                    if layout_fd is not None and layout_fd in readable:
+                        # Layout changes must reach the keyboard immediately —
+                        # every keystroke until then produces wrong symbols.
+                        code = layouts.read_signal()
+                        if code is not None and writer.write(build_layout_packet(code)):
+                            if code != last_layout:
+                                log.info("layout: %s", LAYOUT_CODES[code])
+                            last_layout, last_layout_sent = code, now
+                        continue
+
+                    if events in readable:
                         chunk = events.recv(65536)
                         if not chunk:
                             raise ConnectionError("herdr closed the event stream")
@@ -249,6 +401,18 @@ def run(socket_path: Path, once: bool, clock: bool) -> int:
                         if moved:
                             deadline = min(deadline, now + DEBOUNCE_SECONDS)
                         continue
+
+                    # Nothing expires the layout on the firmware side, so a lost
+                    # packet would stay lost: refresh it periodically and after
+                    # every reopen of the dongle.
+                    if layouts is not None and (
+                        now - last_layout_sent >= LAYOUT_REFRESH_SECONDS or writer.device is None
+                    ):
+                        code = layouts.current()
+                        if code is not None and writer.write(build_layout_packet(code)):
+                            if code != last_layout:
+                                log.info("layout: %s", LAYOUT_CODES[code])
+                            last_layout, last_layout_sent = code, now
 
                     # The firmware keeps the clock until something replaces it,
                     # so this only needs to fire when the minute rolls over —
@@ -282,6 +446,9 @@ def run(socket_path: Path, once: bool, clock: bool) -> int:
                     deadline = last_sent + HEARTBEAT_SECONDS
         except (ConnectionError, OSError, json.JSONDecodeError) as err:
             writer.close()
+            if layouts is not None:
+                layouts.close()
+                layouts.start_monitor()
             log.warning("herdr connection lost (%s); retrying in %.0fs", err, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
@@ -307,6 +474,12 @@ def main() -> int:
         action="store_false",
         help="leave the header clock to Entropy instead of sending it",
     )
+    parser.add_argument(
+        "--no-layout",
+        dest="layout",
+        action="store_false",
+        help="do not sync the host keyboard layout (Universal Symbols need it)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -314,7 +487,7 @@ def main() -> int:
         format="%(levelname)s %(message)s",
     )
     try:
-        return run(args.socket, args.once, args.clock)
+        return run(args.socket, args.once, args.clock, args.layout)
     except KeyboardInterrupt:
         return 0
 

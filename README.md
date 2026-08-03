@@ -70,6 +70,13 @@ As a home-manager module:
   after reopening the dongle). Entropy sends the same packet, but only while
   its GUI is running — without either, the header sits at `--:--`. Pass
   `--no-clock` to leave the clock to Entropy.
+- **Syncs the host keyboard layout** (packet `0xAC`), following KDE's
+  `org.kde.KeyboardLayouts` D-Bus signal via `busctl`. This one is not
+  cosmetic: Universal Symbols resolve their keycodes against the layout the
+  firmware believes is active, so without it the keyboard types the wrong
+  characters. Resent every 60 s and after a reopen, since nothing expires it
+  on the firmware side. `--no-layout` opts out; on non-KDE sessions the
+  daemon logs a warning and carries on without it.
 
 ## Wire format
 
@@ -86,5 +93,9 @@ As a home-manager module:
 | 5    | agents done                 |
 | 6    | agents in an unknown state  |
 | 7    | reserved flags, must be `0` |
+
+Two packets predate this daemon and are reused as-is: `0xAA` (`[1]` hour,
+`[2]` minute) for the header clock and `0xAC` (`[1]` layout: `0` = English,
+`1` = Russian) for Universal Symbols.
 
 The firmware side lives in `rmk/src/host/via/mod.rs` and `rmk/src/host_data.rs`.
