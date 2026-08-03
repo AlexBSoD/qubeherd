@@ -50,7 +50,7 @@ toolchain. As a home-manager module:
 
 ```nix
 {
-  inputs.qubeherd.url = "path:/home/uzz/projects/qubeherd";
+  inputs.qubeherd.url = "github:AlexBSoD/qubeherd";
   # ...
   imports = [ inputs.qubeherd.homeModules.default ];
   services.qubeherd.enable = true;
