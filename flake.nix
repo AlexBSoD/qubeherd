@@ -68,7 +68,10 @@
             systemd.user.services.qubeherd = {
               Unit = {
                 Description = "herdr agent status on the Qube dongle";
+                # The layout source lives on the desktop session bus, so start
+                # after it and stop with it rather than at plain login.
                 After = [ "graphical-session.target" ];
+                PartOf = [ "graphical-session.target" ];
               };
               Service = {
                 ExecStart =
@@ -79,7 +82,7 @@
                 Restart = "on-failure";
                 RestartSec = 5;
               };
-              Install.WantedBy = [ "default.target" ];
+              Install.WantedBy = [ "graphical-session.target" ];
             };
           };
         };

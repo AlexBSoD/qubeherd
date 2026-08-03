@@ -29,6 +29,8 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 const LAYOUT_REFRESH: Duration = Duration::from_secs(10);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// How often to look for a KDE layout service that was not there at startup.
+const LAYOUT_PROBE: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -80,6 +82,8 @@ struct Bridge {
     client: herdr::Client,
     qube: qube::Qube,
     layouts: Option<layout::KdeLayouts>,
+    /// Whether to keep looking for a layout source we do not have yet.
+    wants_layout: bool,
     clock: bool,
     pushed: Pushed,
 }
@@ -183,15 +187,31 @@ fn now_hm() -> (u8, u8) {
 }
 
 /// One connected lifetime: subscribed to herdr, following layout changes.
+///
+/// Returns `Ok(())` when the caller should start a fresh session immediately —
+/// currently only when a layout source appeared and needs its signal stream.
 async fn session(bridge: &mut Bridge) -> Result<()> {
     let mut events = bridge.client.subscribe().await?;
     let mut changes = match bridge.layouts.as_ref() {
         Some(layouts) => Some(layouts.changes().await?),
         None => None,
     };
+    let mut next_layout_probe = Instant::now() + LAYOUT_PROBE;
 
     let mut deadline = Instant::now();
     loop {
+        // The session bus may well outlive us, but KDE's layout service can
+        // also appear late (this daemon can start before Plasma) or come back
+        // after a Plasma restart. Keep looking rather than staying blind.
+        if bridge.wants_layout && bridge.layouts.is_none() && Instant::now() >= next_layout_probe {
+            next_layout_probe = Instant::now() + LAYOUT_PROBE;
+            if let Ok(layouts) = layout::KdeLayouts::connect().await {
+                log::info!("KDE layout service appeared; syncing layout again");
+                bridge.layouts = Some(layouts);
+                return Ok(());
+            }
+        }
+
         let layout_change = async {
             match changes.as_mut() {
                 Some(stream) => stream.next().await,
@@ -218,9 +238,11 @@ async fn session(bridge: &mut Bridge) -> Result<()> {
                     }
                 }
             }
-            _ = sleep_until(deadline) => {
-                bridge.push_periodic().await?;
-                deadline = Instant::now() + HEARTBEAT;
+            _ = sleep_until(deadline.min(next_layout_probe)) => {
+                if Instant::now() >= deadline {
+                    bridge.push_periodic().await?;
+                    deadline = Instant::now() + HEARTBEAT;
+                }
             }
         }
     }
@@ -239,7 +261,7 @@ async fn run(args: Args) -> Result<()> {
         match layout::KdeLayouts::connect().await {
             Ok(layouts) => Some(layouts),
             Err(err) => {
-                log::warn!("no KDE layout service ({err:#}); Universal Symbols will not be synced");
+                log::warn!("no KDE layout service yet ({err:#}); will keep looking");
                 None
             }
         }
@@ -249,6 +271,7 @@ async fn run(args: Args) -> Result<()> {
         client: herdr::Client::new(&socket_path),
         qube: qube::Qube::new(),
         layouts,
+        wants_layout: !args.no_layout,
         clock: !args.no_clock,
         pushed: Pushed::default(),
     };
@@ -261,7 +284,8 @@ async fn run(args: Args) -> Result<()> {
     let mut backoff = RECONNECT_MIN;
     loop {
         match session(&mut bridge).await {
-            Ok(()) => unreachable!("the session loop only exits with an error"),
+            // A layout source appeared: restart at once to pick up its signals.
+            Ok(()) => backoff = RECONNECT_MIN,
             Err(err) => {
                 bridge.qube.close();
                 bridge.pushed = Pushed::default();
