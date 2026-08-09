@@ -39,6 +39,10 @@ struct Args {
     #[arg(long)]
     socket: Option<PathBuf>,
 
+    /// hidraw node to write to, skipping the search (e.g. /dev/hidraw5)
+    #[arg(long)]
+    device: Option<PathBuf>,
+
     /// Send one update from the current state and exit
     #[arg(long)]
     once: bool,
@@ -269,7 +273,7 @@ async fn run(args: Args) -> Result<()> {
 
     let mut bridge = Bridge {
         client: herdr::Client::new(&socket_path),
-        qube: qube::Qube::new(),
+        qube: qube::Qube::new(args.device.clone()),
         layouts,
         wants_layout: !args.no_layout,
         clock: !args.no_clock,

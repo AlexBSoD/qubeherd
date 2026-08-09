@@ -49,13 +49,16 @@ pub fn layout_packet(code: u8) -> [u8; PACKET_LEN] {
 pub struct Qube {
     device: Option<File>,
     path: Option<PathBuf>,
+    /// Set from `--device` to skip the search entirely.
+    pinned: Option<PathBuf>,
 }
 
 impl Qube {
-    pub fn new() -> Self {
+    pub fn new(pinned: Option<PathBuf>) -> Self {
         Self {
             device: None,
             path: None,
+            pinned,
         }
     }
 
@@ -68,12 +71,21 @@ impl Qube {
         if self.device.is_some() {
             return Ok(false);
         }
-        let path = find_raw_hid_device()?.context("no Ergohaven raw HID interface found")?;
+        let (path, name) = match self.pinned.clone() {
+            Some(path) => (path, None),
+            None => {
+                let found = find_raw_hid_device()?.context("no Ergohaven raw HID interface found")?;
+                (found.path, Some(found.name))
+            }
+        };
         let device = OpenOptions::new()
             .write(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        log::info!("writing to {}", path.display());
+        match name {
+            Some(name) => log::info!("writing to {} ({name})", path.display()),
+            None => log::info!("writing to {}", path.display()),
+        }
         self.device = Some(device);
         self.path = Some(path);
         Ok(true)
@@ -100,34 +112,47 @@ impl Qube {
     }
 }
 
+/// One hidraw node that speaks the QMK-compatible raw HID protocol.
+struct Candidate {
+    path: PathBuf,
+    /// The node number, because the directory listing is lexicographic and
+    /// there `hidraw10` sorts before `hidraw2`: without this the pick silently
+    /// flips between replugs once numbering crosses nine.
+    number: u32,
+    name: String,
+}
+
 /// Locates the keyboard's raw-HID node by walking sysfs.
 ///
 /// Matching on the report descriptor rather than a fixed product id keeps this
-/// working across the Qube/mini/micro variants, which differ in pid.
-fn find_raw_hid_device() -> Result<Option<PathBuf>> {
-    let mut entries: Vec<_> = std::fs::read_dir("/sys/class/hidraw")
+/// working across the Qube/mini/micro variants, which differ in pid. The
+/// tradeoff is that a wired half attached alongside the dongle matches just as
+/// well — writes to the wrong node succeed silently, so say so out loud and let
+/// `--device` settle it.
+fn find_raw_hid_device() -> Result<Option<Candidate>> {
+    let mut candidates: Vec<_> = std::fs::read_dir("/sys/class/hidraw")
         .context("listing /sys/class/hidraw")?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| candidate(&entry.path()))
         .collect();
-    entries.sort();
+    candidates.sort_by_key(|candidate| candidate.number);
 
-    for entry in entries {
-        if !matches_qube(&entry) {
-            continue;
-        }
-        let Some(name) = entry.file_name() else {
-            continue;
-        };
-        return Ok(Some(Path::new("/dev").join(name)));
+    if candidates.len() > 1 {
+        let others: Vec<_> = candidates[1..]
+            .iter()
+            .map(|candidate| format!("{} ({})", candidate.path.display(), candidate.name))
+            .collect();
+        log::warn!(
+            "several Ergohaven raw HID interfaces match; using {} and ignoring {} — pass --device to pick another",
+            candidates[0].path.display(),
+            others.join(", ")
+        );
     }
-    Ok(None)
+    Ok(candidates.into_iter().next())
 }
 
-fn matches_qube(entry: &Path) -> bool {
-    let uevent = match std::fs::read_to_string(entry.join("device/uevent")) {
-        Ok(text) => text,
-        Err(_) => return false,
-    };
+fn candidate(entry: &Path) -> Option<Candidate> {
+    let uevent = std::fs::read_to_string(entry.join("device/uevent")).ok()?;
     let vendor_matches = uevent
         .lines()
         .find_map(|line| line.strip_prefix("HID_ID="))
@@ -135,8 +160,22 @@ fn matches_qube(entry: &Path) -> bool {
         .and_then(|vendor| u32::from_str_radix(vendor, 16).ok())
         .is_some_and(|vendor| vendor == u32::from(HID_VENDOR_ID));
     if !vendor_matches {
-        return false;
+        return None;
     }
-    std::fs::read(entry.join("device/report_descriptor"))
-        .is_ok_and(|descriptor| descriptor.starts_with(&RAW_HID_DESCRIPTOR_PREFIX))
+    let raw_hid = std::fs::read(entry.join("device/report_descriptor"))
+        .is_ok_and(|descriptor| descriptor.starts_with(&RAW_HID_DESCRIPTOR_PREFIX));
+    if !raw_hid {
+        return None;
+    }
+
+    let node = entry.file_name()?.to_str()?;
+    Some(Candidate {
+        path: Path::new("/dev").join(node),
+        number: node.trim_start_matches("hidraw").parse().unwrap_or(u32::MAX),
+        name: uevent
+            .lines()
+            .find_map(|line| line.strip_prefix("HID_NAME="))
+            .unwrap_or("unnamed")
+            .to_string(),
+    })
 }
