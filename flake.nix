@@ -78,7 +78,13 @@
                   "${lib.getExe cfg.package}"
                   + lib.optionalString (cfg.socket != null) " --socket ${cfg.socket}";
                 # The daemon reconnects on its own; a restart only matters if
-                # it dies outright (e.g. the socket path never appears).
+                # it dies outright (e.g. the socket path never appears) — or if
+                # it stops going round its loop, which is what the watchdog is
+                # for: a wedged process is otherwise indistinguishable from an
+                # idle one, and Restart=on-failure would never hear about it.
+                Type = "notify";
+                NotifyAccess = "main";
+                WatchdogSec = 90;
                 Restart = "on-failure";
                 RestartSec = 5;
               };

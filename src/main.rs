@@ -9,6 +9,7 @@
 
 mod herdr;
 mod layout;
+mod notify;
 mod qube;
 
 use std::path::PathBuf;
@@ -36,6 +37,12 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 const RAPID_RESTART_LIMIT: u32 = 3;
 /// How often to look for a KDE layout service that was not there at startup.
 const LAYOUT_PROBE: Duration = Duration::from_secs(30);
+/// How often to say what the daemon has been doing.
+///
+/// A healthy daemon is otherwise silent, which makes silence useless as a
+/// signal: a spin, a freeze and an idle afternoon all read the same in the
+/// journal. Rates make them tell themselves apart.
+const SUMMARY: Duration = Duration::from_secs(600);
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -87,6 +94,30 @@ struct Pushed {
     layout_at: Option<Instant>,
 }
 
+/// Counters for the periodic summary. Cheap enough to keep unconditionally.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    /// Times the event loop went round. The number that would have made the
+    /// spin obvious: a few hundred an hour is normal, millions is a bug.
+    wakeups: u64,
+    events: u64,
+    sessions: u64,
+    packets: u64,
+    opens: u64,
+}
+
+impl Stats {
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            wakeups: self.wakeups - earlier.wakeups,
+            events: self.events - earlier.events,
+            sessions: self.sessions - earlier.sessions,
+            packets: self.packets - earlier.packets,
+            opens: self.opens - earlier.opens,
+        }
+    }
+}
+
 struct Bridge {
     client: herdr::Client,
     qube: qube::Qube,
@@ -95,9 +126,43 @@ struct Bridge {
     wants_layout: bool,
     clock: bool,
     pushed: Pushed,
+    notifier: notify::Notifier,
+    /// Process-wide, so the numbers survive session restarts — which are
+    /// themselves one of the things worth counting.
+    stats: Stats,
+    reported: Stats,
+    started: Instant,
+    next_summary: Instant,
 }
 
 impl Bridge {
+    /// Counters as of now, including the ones the device keeps.
+    fn snapshot(&self) -> Stats {
+        let (packets, opens) = self.qube.counters();
+        Stats {
+            packets,
+            opens,
+            ..self.stats
+        }
+    }
+
+    fn log_summary(&mut self) {
+        let now = Instant::now();
+        let stats = self.snapshot();
+        let delta = stats.since(self.reported);
+        log::info!(
+            "alive {}m; last {}m: {} wake-ups, {} events, {} packets, {} device opens, {} session restarts",
+            self.started.elapsed().as_secs() / 60,
+            SUMMARY.as_secs() / 60,
+            delta.wakeups,
+            delta.events,
+            delta.packets,
+            delta.opens,
+            delta.sessions,
+        );
+        self.reported = stats;
+        self.next_summary = now + SUMMARY;
+    }
     /// Sends the clock and the layout, whatever their last known values.
     ///
     /// Called after every (re)open of the device: a keyboard that just rebooted
@@ -231,6 +296,9 @@ async fn session(bridge: &mut Bridge) -> Result<()> {
 
     let mut deadline = Instant::now();
     loop {
+        bridge.stats.wakeups += 1;
+        bridge.notifier.ping();
+
         // The session bus may well outlive us, but KDE's layout service can
         // also appear late (this daemon can start before Plasma) or come back
         // after a Plasma restart. Keep looking rather than staying blind.
@@ -291,8 +359,12 @@ async fn session(bridge: &mut Bridge) -> Result<()> {
                 bridge.push_periodic().await?;
                 deadline = Instant::now() + HEARTBEAT;
             }
+            _ = sleep_until(bridge.next_summary) => {
+                bridge.log_summary();
+            }
             result = events.next() => {
                 result?;
+                bridge.stats.events += 1;
                 // Pull the beat in, never push it out: a burst coalesces into
                 // one packet instead of deferring it for the length of the burst.
                 deadline = deadline.min(Instant::now() + DEBOUNCE);
@@ -335,7 +407,15 @@ async fn run(args: Args) -> Result<()> {
         wants_layout: !args.no_layout,
         clock: !args.no_clock,
         pushed: Pushed::default(),
+        notifier: notify::Notifier::from_env(),
+        stats: Stats::default(),
+        reported: Stats::default(),
+        started: Instant::now(),
+        next_summary: Instant::now() + SUMMARY,
     };
+    // Before the dongle is looked for: the daemon does its job across replugs,
+    // so readiness cannot wait on hardware being present right now.
+    bridge.notifier.ready();
 
     if args.once {
         bridge.ensure_ready().await?;
@@ -346,6 +426,7 @@ async fn run(args: Args) -> Result<()> {
     let mut rapid_restarts = 0;
     loop {
         let started = Instant::now();
+        bridge.stats.sessions += 1;
         let outcome = session(&mut bridge).await;
         // Without this the backoff decays at most once per process: a boot race
         // that saturates it at RECONNECT_MAX would still be charging 30s for a
@@ -373,6 +454,9 @@ async fn run(args: Args) -> Result<()> {
                 bridge.qube.close();
                 bridge.pushed = Pushed::default();
                 log::warn!("{err:#}; retrying in {}s", backoff.as_secs());
+                // The loop is where pings normally come from, and this is the
+                // one place that stays outside it for any length of time.
+                bridge.notifier.ping();
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_MAX);
             }
@@ -389,9 +473,16 @@ async fn main() -> ExitCode {
         } else {
             log::LevelFilter::Info
         })
+        // After the default, so RUST_LOG can raise detail on a running service
+        // without editing the unit — and can single out one module rather than
+        // drowning the journal in zbus internals.
+        .parse_default_env()
         .format_target(false)
+        // journald stamps its own; a bare `qubeherd` in a terminal is the only
+        // case that loses them.
         .format_timestamp(None)
         .init();
+    log::info!("qubeherd {}", env!("CARGO_PKG_VERSION"));
 
     match run(args).await.context("qubeherd") {
         Ok(()) => ExitCode::SUCCESS,

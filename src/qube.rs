@@ -51,6 +51,8 @@ pub struct Qube {
     path: Option<PathBuf>,
     /// Set from `--device` to skip the search entirely.
     pinned: Option<PathBuf>,
+    writes: u64,
+    opens: u64,
 }
 
 impl Qube {
@@ -59,7 +61,15 @@ impl Qube {
             device: None,
             path: None,
             pinned,
+            writes: 0,
+            opens: 0,
         }
+    }
+
+    /// Packets that reached the device, and how often it had to be opened —
+    /// both only meaningful as a rate, which is what the summary reports.
+    pub fn counters(&self) -> (u64, u64) {
+        (self.writes, self.opens)
     }
 
     /// Opens the device if needed; returns true when this call opened it.
@@ -88,6 +98,7 @@ impl Qube {
         }
         self.device = Some(device);
         self.path = Some(path);
+        self.opens += 1;
         Ok(true)
     }
 
@@ -102,6 +113,7 @@ impl Qube {
             self.close();
             return Err(err).context("writing to the dongle");
         }
+        self.writes += 1;
         log::debug!("sent {:02x?}", &payload[..7]);
         Ok(())
     }
