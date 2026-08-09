@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use futures_util::StreamExt as _;
 use tokio::time::{sleep, Instant};
 
 /// Agent states flap between tool calls; coalesce a burst into one packet.
@@ -192,12 +191,23 @@ fn now_hm() -> (u8, u8) {
 
 /// One connected lifetime: subscribed to herdr, following layout changes.
 ///
-/// Returns `Ok(())` when the caller should start a fresh session immediately —
-/// currently only when a layout source appeared and needs its signal stream.
+/// Returns `Ok(())` when the caller should start a fresh session: the layout
+/// source appeared and needs its signal streams, or the one we had went away
+/// and must be dropped before it can be looked for again.
 async fn session(bridge: &mut Bridge) -> Result<()> {
     let mut events = bridge.client.subscribe().await?;
-    let mut changes = match bridge.layouts.as_ref() {
-        Some(layouts) => Some(layouts.changes().await?),
+    // The layout source is optional. Failing to follow it costs the layout, so
+    // let go of the source and keep the clock and the agent counts running,
+    // rather than propagating and taking the whole daemon down with it.
+    let mut signals = match bridge.layouts.as_ref() {
+        Some(layouts) => match layouts.signals().await {
+            Ok(signals) => Some(signals),
+            Err(err) => {
+                log::warn!("cannot follow layout changes ({err:#}); will look again");
+                bridge.layouts = None;
+                None
+            }
+        },
         None => None,
     };
     let mut next_layout_probe = Instant::now() + LAYOUT_PROBE;
@@ -207,48 +217,78 @@ async fn session(bridge: &mut Bridge) -> Result<()> {
         // The session bus may well outlive us, but KDE's layout service can
         // also appear late (this daemon can start before Plasma) or come back
         // after a Plasma restart. Keep looking rather than staying blind.
-        if bridge.wants_layout && bridge.layouts.is_none() && Instant::now() >= next_layout_probe {
-            next_layout_probe = Instant::now() + LAYOUT_PROBE;
-            if let Ok(layouts) = layout::KdeLayouts::connect().await {
-                log::info!("KDE layout service appeared; syncing layout again");
-                bridge.layouts = Some(layouts);
-                return Ok(());
-            }
-        }
-
-        let layout_change = async {
-            match changes.as_mut() {
-                Some(stream) => stream.next().await,
-                // Keep this branch pending forever rather than resolving to
-                // None in a busy loop when there is no layout source.
-                None => std::future::pending().await,
-            }
-        };
+        let probing = bridge.wants_layout && bridge.layouts.is_none();
 
         tokio::select! {
-            result = events.next() => {
-                result?;
-                deadline = deadline.min(Instant::now() + DEBOUNCE);
-            }
-            signal = layout_change => {
-                // A layout change must reach the keyboard immediately: every
-                // keystroke until it does produces the wrong symbol.
-                let index = signal.and_then(|signal| signal.args().ok().map(|args| args.index));
-                if let Some(index) = index {
+            // Branch order is a priority, not a formality:
+            //   1. a layout change must reach the keyboard immediately — every
+            //      keystroke until it does produces the wrong symbol;
+            //   2. the beat comes next so a chatty herdr can never starve it;
+            //   3. herdr events are only hints, and `agent.list` is the truth,
+            //      so they are the one thing that can safely wait.
+            biased;
+
+            change = next_change(&mut signals) => match change {
+                layout::Change::Active(index) => {
                     if let Some(layouts) = bridge.layouts.as_mut() {
                         if let Some(code) = layouts.code_for_index(index).await {
                             bridge.push_layout(code).await?;
                         }
                     }
                 }
-            }
-            _ = sleep_until(deadline.min(next_layout_probe)) => {
-                if Instant::now() >= deadline {
-                    bridge.push_periodic().await?;
-                    deadline = Instant::now() + HEARTBEAT;
+                layout::Change::ListEdited => {
+                    // An index is a position in that list: a reorder keeping the
+                    // same length would otherwise map ru onto the en code and
+                    // stay wrong until this daemon restarts.
+                    if let Some(layouts) = bridge.layouts.as_mut() {
+                        layouts.refresh_names().await;
+                        if let Some(code) = layouts.current().await {
+                            bridge.push_layout(code).await?;
+                        }
+                    }
+                }
+                layout::Change::Lost => {
+                    // An ended stream is Ready(None) on every later poll, so
+                    // leaving it in the select! would spin this loop at 100% CPU
+                    // and — on a current_thread runtime, where nothing else can
+                    // make progress while we never yield — freeze the timer and
+                    // the herdr socket with it.
+                    log::warn!("the layout service went away; will look for it again");
+                    bridge.layouts = None;
+                    return Ok(());
+                }
+                layout::Change::Unreadable => {}
+            },
+            // The probe deadline is armed only in the same breath as it is
+            // consulted: a disarmed one cannot wake us, because the guard stops
+            // the branch from being polled at all.
+            _ = sleep_until(next_layout_probe), if probing => {
+                next_layout_probe = Instant::now() + LAYOUT_PROBE;
+                if let Ok(layouts) = layout::KdeLayouts::connect().await {
+                    log::info!("KDE layout service appeared; syncing layout again");
+                    bridge.layouts = Some(layouts);
+                    return Ok(());
                 }
             }
+            _ = sleep_until(deadline) => {
+                bridge.push_periodic().await?;
+                deadline = Instant::now() + HEARTBEAT;
+            }
+            result = events.next() => {
+                result?;
+                // Pull the beat in, never push it out: a burst coalesces into
+                // one packet instead of deferring it for the length of the burst.
+                deadline = deadline.min(Instant::now() + DEBOUNCE);
+            }
         }
+    }
+}
+
+/// The next layout signal, or forever-pending when there is no layout source.
+async fn next_change(signals: &mut Option<layout::Signals>) -> layout::Change {
+    match signals.as_mut() {
+        Some(signals) => signals.next().await,
+        None => std::future::pending().await,
     }
 }
 

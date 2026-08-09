@@ -4,12 +4,18 @@
 //! believes is active, so a missed update here means the keyboard types the
 //! wrong characters — this is a correctness path, not a cosmetic one.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
-use zbus::Connection;
 
 /// Layout codes the firmware understands (`universal_symbols::HostLayout`).
 const LAYOUT_EN: u8 = 0;
 const LAYOUT_RU: u8 = 1;
+
+/// D-Bus has no protocol-level reply timeout and zbus applies none by default,
+/// so a name that is owned by a wedged process (kwin stuck on a GPU reset) would
+/// hang every call forever — and these calls are awaited inside the event loop.
+const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn code_name(code: u8) -> &'static str {
     if code == LAYOUT_RU {
@@ -44,8 +50,27 @@ pub struct KdeLayouts {
 }
 
 impl KdeLayouts {
+    /// Connects to the layout service, bounded in time.
+    ///
+    /// The probe that calls this runs inside the event loop, so an unbounded
+    /// connect would stall the heartbeat and the clock along with it — and the
+    /// handshake happens before `method_timeout` can apply to anything.
     pub async fn connect() -> Result<Self> {
-        let connection = Connection::session()
+        tokio::time::timeout(METHOD_TIMEOUT, Self::connect_inner())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the layout service did not answer within {}s",
+                    METHOD_TIMEOUT.as_secs()
+                )
+            })?
+    }
+
+    async fn connect_inner() -> Result<Self> {
+        let connection = zbus::connection::Builder::session()
+            .context("locating the session bus")?
+            .method_timeout(METHOD_TIMEOUT)
+            .build()
             .await
             .context("connecting to the session bus")?;
         let proxy = KeyboardLayoutsProxy::new(&connection)
@@ -65,7 +90,7 @@ impl KdeLayouts {
         Ok(layouts)
     }
 
-    async fn refresh_names(&mut self) {
+    pub async fn refresh_names(&mut self) {
         match self.proxy.get_layouts_list().await {
             Ok(list) => {
                 self.names = list
@@ -99,16 +124,70 @@ impl KdeLayouts {
         self.code_for_index(index).await
     }
 
-    /// Signal stream of layout changes.
+    /// Signal streams for layout changes and for edits to the layout list.
     ///
-    /// Built from a cloned proxy so the stream does not borrow `self` — the
-    /// main loop needs `&mut self` to resolve indices while holding it.
-    pub async fn changes(&self) -> Result<layoutChangedStream> {
-        self.proxy
-            .clone()
-            .receive_layout_changed()
-            .await
-            .context("subscribing to layoutChanged")
+    /// Built from cloned proxies so the streams do not borrow `self` — the main
+    /// loop needs `&mut self` to resolve indices while holding them.
+    pub async fn signals(&self) -> Result<Signals> {
+        Ok(Signals {
+            changed: self
+                .proxy
+                .clone()
+                .receive_layout_changed()
+                .await
+                .context("subscribing to layoutChanged")?,
+            list_changed: self
+                .proxy
+                .clone()
+                .receive_layout_list_changed()
+                .await
+                .context("subscribing to layoutListChanged")?,
+        })
+    }
+}
+
+/// What the layout service just told us.
+pub enum Change {
+    /// The active layout moved to this index.
+    Active(u32),
+    /// The list itself was edited, so the cached names are suspect.
+    ListEdited,
+    /// The stream ended: the bus connection behind it is gone for good and no
+    /// further signal will ever arrive on it.
+    Lost,
+    /// A signal we could not read. Nothing to do but wait for the next one.
+    Unreadable,
+}
+
+pub struct Signals {
+    changed: layoutChangedStream,
+    list_changed: layoutListChangedStream,
+}
+
+impl Signals {
+    /// Waits for the next layout signal.
+    ///
+    /// Both arms are stream reads, which are cancellation-safe, so this is safe
+    /// to use as a `select!` arm in the main loop.
+    pub async fn next(&mut self) -> Change {
+        use futures_util::StreamExt as _;
+
+        tokio::select! {
+            signal = self.changed.next() => match signal {
+                None => Change::Lost,
+                Some(signal) => match signal.args() {
+                    Ok(args) => Change::Active(args.index),
+                    Err(err) => {
+                        log::warn!("cannot read a layoutChanged signal: {err}");
+                        Change::Unreadable
+                    }
+                },
+            },
+            signal = self.list_changed.next() => match signal {
+                None => Change::Lost,
+                Some(_) => Change::ListEdited,
+            },
+        }
     }
 }
 
