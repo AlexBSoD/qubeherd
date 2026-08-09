@@ -28,6 +28,12 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 const LAYOUT_REFRESH: Duration = Duration::from_secs(10);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// A session that lasted this long is evidence the world is healthy again, and
+/// the next hiccup deserves a fast retry rather than the backoff we ended on.
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// Self-requested restarts are normally instant; more than a few in a row
+/// without a healthy session in between means something is flapping.
+const RAPID_RESTART_LIMIT: u32 = 3;
 /// How often to look for a KDE layout service that was not there at startup.
 const LAYOUT_PROBE: Duration = Duration::from_secs(30);
 
@@ -98,6 +104,11 @@ impl Bridge {
     /// starts from `HostLayout::English` and an empty clock, so replaying them
     /// is what keeps Universal Symbols correct across a reflash or a replug.
     async fn resync_after_open(&mut self) -> Result<()> {
+        // The counts are gone from the keyboard too, and `pushed` still claims
+        // they are on screen. Forget them so the next beat resends them instead
+        // of waiting out a heartbeat the firmware may not survive.
+        self.pushed.counts = None;
+        self.pushed.counts_at = None;
         if self.clock {
             let (hour, minute) = now_hm();
             self.qube.write(&qube::clock_packet(hour, minute))?;
@@ -151,13 +162,19 @@ impl Bridge {
             .is_none_or(|at| at.elapsed() >= LAYOUT_REFRESH);
         if stale {
             if let Some(layouts) = self.layouts.as_mut() {
-                if let Some(code) = layouts.current().await {
+                let code = layouts.current().await;
+                // Stamp the attempt, not the success. A layout the firmware has
+                // no code for (a third one such as `de`) or a service that
+                // stopped answering yields None every time, and rate-limiting
+                // only on success would turn every wake-up into a bus round trip
+                // and a log line.
+                self.pushed.layout_at = Some(Instant::now());
+                if let Some(code) = code {
                     self.qube.write(&qube::layout_packet(code))?;
                     if self.pushed.layout != Some(code) {
                         log::info!("layout: {}", layout::code_name(code));
                     }
                     self.pushed.layout = Some(code);
-                    self.pushed.layout_at = Some(Instant::now());
                 }
             }
         }
@@ -326,10 +343,32 @@ async fn run(args: Args) -> Result<()> {
     }
 
     let mut backoff = RECONNECT_MIN;
+    let mut rapid_restarts = 0;
     loop {
-        match session(&mut bridge).await {
-            // A layout source appeared: restart at once to pick up its signals.
-            Ok(()) => backoff = RECONNECT_MIN,
+        let started = Instant::now();
+        let outcome = session(&mut bridge).await;
+        // Without this the backoff decays at most once per process: a boot race
+        // that saturates it at RECONNECT_MAX would still be charging 30s for a
+        // one-second herdr restart hours later — long enough for the firmware to
+        // expire the counts and blank the row over nothing.
+        if started.elapsed() >= HEALTHY_SESSION {
+            backoff = RECONNECT_MIN;
+            rapid_restarts = 0;
+        }
+
+        match outcome {
+            // A restart we asked for ourselves: the layout source appeared or
+            // went away, and either way the next session is built differently.
+            Ok(()) => {
+                rapid_restarts += 1;
+                if rapid_restarts > RAPID_RESTART_LIMIT {
+                    log::warn!(
+                        "the layout source keeps flapping; pausing for {}s",
+                        RECONNECT_MIN.as_secs()
+                    );
+                    sleep(RECONNECT_MIN).await;
+                }
+            }
             Err(err) => {
                 bridge.qube.close();
                 bridge.pushed = Pushed::default();
