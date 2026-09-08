@@ -1,11 +1,12 @@
 # qubeherd
 
-Shows how many coding agents are working, idle or blocked on the screen of an
-Ergohaven Qube dongle.
+Shows how many coding agents are working, idle or blocked — and how much of the
+Claude Code limits is already spent — on the screen of an Ergohaven Qube dongle.
 
 ```
-herdr.sock ──events.subscribe──▶ qubeherd ──raw HID 0xB0──▶ Qube dongle ──▶ screen
-              (+ agent.list)
+herdr.sock ──events.subscribe (+ agent.list)──┐
+                                              ├─▶ qubeherd ──raw HID 0xB0/0xB1──▶ Qube dongle ──▶ screen
+~/.claude.json ──cachedUsageUtilization───────┘
 ```
 
 [herdr](https://herdr.dev) tracks the state of every agent pane it manages.
@@ -15,7 +16,8 @@ gauges:
 
 ```
 ┌────────────────────────────────┐
-│ 12:34                    BASE  │
+│ 5H ▓▓▓▓░░░░░░░░░░░░░░░░   24%  │
+│ 7D ▓░░░░░░░░░░░░░░░░░░░    2%  │
 │ ▎  WORKING      BLOCKED     ▎  │
 │ ▎     1                     ▎  │
 │ ▎  IDLE         DONE        ▎  │
@@ -25,11 +27,13 @@ gauges:
 
 A zero count draws no number, so an idle screen reads as quiet. The gauges on
 the edges are the per-half batteries — position says which half, so they carry
-no `L`/`R` letter.
+no `L`/`R` letter. The two bars on top are the Claude Code limit windows, the
+5-hour session over the 7-day one.
 
 ## Requirements
 
-- **Firmware with the agent packet.** Stock RMK ignores packet type `0xB0`;
+- **Firmware with the agent and usage packets.** Stock RMK ignores packet types
+  `0xB0` and `0xB1`;
   you need a build from the `feat/k04-agent-status` branch of
   [AlexBSoD/rmk](https://github.com/AlexBSoD/rmk) or later.
 - **Write access to the raw HID node.** The Ergohaven udev rules already grant
@@ -46,6 +50,7 @@ $ qubeherd --once --verbose      # push the current state once, then exit
 [INFO ] writing to /dev/hidraw3 (Ergohaven Qube)
 [INFO ] layout: ru
 [INFO ] agents: 1 working, 2 idle, 0 blocked, 0 done, 0 unknown
+[INFO ] limits: 5h 24%, 7d 2%
 
 $ qubeherd                       # stay running
 $ nix run .                      # …or straight from the flake
@@ -57,6 +62,8 @@ $ nix run .                      # …or straight from the flake
 | `--device <path>` | write to this hidraw node instead of searching for one      |
 | `--once`          | push the current state once and exit                        |
 | `--no-clock`      | leave the header clock to Entropy                           |
+| `--no-usage`      | leave the Claude Code limit bars empty                       |
+| `--claude-config` | read the limits from this file instead of `~/.claude.json`   |
 | `--no-layout`     | do not sync the keyboard layout (Universal Symbols need it) |
 | `--verbose`       | log every packet                                            |
 
@@ -106,6 +113,16 @@ source lives on the desktop session bus.
   `hidraw2` and would silently flip the pick between replugs. A wired half
   attached alongside the dongle matches just as well, so several matches are
   logged as a warning — `--device` settles it.
+- **Reads the Claude Code limits off disk** (packet `0xB1`). Claude Code has no
+  command that reports them: the percentages arrive on
+  `anthropic-ratelimit-unified-*` response headers and the CLI caches them in
+  `~/.claude.json` under `cachedUsageUtilization`. That cache only refreshes
+  while a session is running, so a window whose own `resets_at` has passed is
+  reported as `0` rather than replayed — otherwise an afternoon away would
+  leave the screen advertising a limit that has since rolled over. An
+  unreadable file or window is sent as `0xFF` and draws `--`, never a
+  confident `0%`. The file is small (~90 KB), so it is simply reread on every
+  beat.
 - **Sends the header clock too** (packet `0xAA`, on every minute rollover and
   after reopening the dongle). Entropy sends the same packet, but only while
   its GUI is running — without either, the header sits at `--:--`. Pass
@@ -152,6 +169,15 @@ source lives on the desktop session bus.
 | 6    | agents in an unknown state  |
 | 7    | reserved flags, must be `0` |
 
+The limit bars are their own packet:
+
+| Byte | Meaning                                        |
+| ---- | ---------------------------------------------- |
+| 0    | `0xB1` — subscription limits                    |
+| 1    | protocol version (`0x01`)                       |
+| 2    | 5-hour window, percent used, `0xFF` if unknown  |
+| 3    | 7-day window, same encoding                     |
+
 The firmware swallows a packet whose version byte it does not know rather than
 misreading it, and keeps the unknown count without giving it a cell on screen.
 
@@ -160,5 +186,5 @@ Two packets predate this daemon and are reused as-is: `0xAA` (`[1]` hour,
 `1` = Russian) for Universal Symbols.
 
 The firmware side lives in `rmk/src/host/via/mod.rs` (packet parsing),
-`rmk/src/host_data.rs` (the 30 s expiry) and
+`rmk/src/host_data.rs` (the 30 s expiry, shared by both feeds) and
 `keyboards/k04/src/qube_display.rs` (the screen itself).

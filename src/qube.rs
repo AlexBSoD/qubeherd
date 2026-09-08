@@ -9,6 +9,10 @@ use anyhow::{Context, Result};
 /// Packet types, mirrored in `rmk/src/host/via/mod.rs`.
 const PACKET_AGENTS: u8 = 0xB0;
 const PACKET_AGENTS_VERSION: u8 = 0x01;
+const PACKET_USAGE: u8 = 0xB1;
+const PACKET_USAGE_VERSION: u8 = 0x01;
+/// A window the daemon could not read at all, as opposed to one sitting at 0%.
+const PACKET_USAGE_UNKNOWN: u8 = 0xFF;
 const PACKET_CLOCK: u8 = 0xAA;
 const PACKET_LAYOUT: u8 = 0xAC;
 const PACKET_LEN: usize = 32;
@@ -27,6 +31,15 @@ pub fn agents_packet(counts: &crate::herdr::AgentCounts) -> [u8; PACKET_LEN] {
     payload[4] = counts.blocked;
     payload[5] = counts.done;
     payload[6] = counts.unknown;
+    payload
+}
+
+pub fn usage_packet(usage: &crate::usage::Usage) -> [u8; PACKET_LEN] {
+    let mut payload = [0u8; PACKET_LEN];
+    payload[0] = PACKET_USAGE;
+    payload[1] = PACKET_USAGE_VERSION;
+    payload[2] = usage.five_hour.unwrap_or(PACKET_USAGE_UNKNOWN);
+    payload[3] = usage.seven_day.unwrap_or(PACKET_USAGE_UNKNOWN);
     payload
 }
 

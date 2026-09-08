@@ -5,12 +5,14 @@
 //! has a screen right under your hands. This bridges the two over raw HID,
 //! and carries the two host-data packets Entropy would otherwise own: the
 //! header clock and — more importantly — the active keyboard layout, which
-//! Universal Symbols need to pick the right keycodes.
+//! Universal Symbols need to pick the right keycodes. The screen also shows
+//! how much of the Claude Code limits is spent, read from the CLI's own cache.
 
 mod herdr;
 mod layout;
 mod notify;
 mod qube;
+mod usage;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -67,6 +69,15 @@ struct Args {
     #[arg(long)]
     no_layout: bool,
 
+    /// Leave the Claude Code limit bars empty instead of feeding them
+    #[arg(long)]
+    no_usage: bool,
+
+    /// Claude Code config to read the limits from
+    /// (default: $CLAUDE_CONFIG_DIR/.claude.json or ~/.claude.json)
+    #[arg(long)]
+    claude_config: Option<PathBuf>,
+
     /// Log every packet
     #[arg(long)]
     verbose: bool,
@@ -92,6 +103,8 @@ struct Pushed {
     clock: Option<(u8, u8)>,
     layout: Option<u8>,
     layout_at: Option<Instant>,
+    usage: Option<usage::Usage>,
+    usage_at: Option<Instant>,
 }
 
 /// Counters for the periodic summary. Cheap enough to keep unconditionally.
@@ -125,6 +138,8 @@ struct Bridge {
     /// Whether to keep looking for a layout source we do not have yet.
     wants_layout: bool,
     clock: bool,
+    /// `None` when the limits are not being fed at all.
+    claude_config: Option<PathBuf>,
     pushed: Pushed,
     notifier: notify::Notifier,
     /// Process-wide, so the numbers survive session restarts — which are
@@ -174,6 +189,8 @@ impl Bridge {
         // of waiting out a heartbeat the firmware may not survive.
         self.pushed.counts = None;
         self.pushed.counts_at = None;
+        self.pushed.usage = None;
+        self.pushed.usage_at = None;
         if self.clock {
             let (hour, minute) = now_hm();
             self.qube.write(&qube::clock_packet(hour, minute))?;
@@ -260,6 +277,23 @@ impl Bridge {
             self.qube.write(&qube::agents_packet(&counts))?;
             self.pushed.counts = Some(counts);
             self.pushed.counts_at = Some(Instant::now());
+        }
+
+        // Same bargain for the limits, which move even slower: the file is
+        // small enough to reread on every beat, and the packet only goes out
+        // when a percentage moved or the firmware's expiry needs feeding.
+        let usage = self.claude_config.as_deref().map(usage::read);
+        if let Some(usage) = usage {
+            let changed = self.pushed.usage != Some(usage);
+            let stale = self.pushed.usage_at.is_none_or(|at| at.elapsed() >= HEARTBEAT);
+            if changed || stale {
+                if changed {
+                    log::info!("limits: {usage}");
+                }
+                self.qube.write(&qube::usage_packet(&usage))?;
+                self.pushed.usage = Some(usage);
+                self.pushed.usage_at = Some(Instant::now());
+            }
         }
         Ok(())
     }
@@ -406,6 +440,8 @@ async fn run(args: Args) -> Result<()> {
         layouts,
         wants_layout: !args.no_layout,
         clock: !args.no_clock,
+        claude_config: (!args.no_usage)
+            .then(|| args.claude_config.clone().unwrap_or_else(usage::default_config_path)),
         pushed: Pushed::default(),
         notifier: notify::Notifier::from_env(),
         stats: Stats::default(),
