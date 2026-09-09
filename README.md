@@ -6,7 +6,7 @@ Claude Code limits is already spent — on the screen of an Ergohaven Qube dongl
 ```
 herdr.sock ──events.subscribe (+ agent.list)──┐
                                               ├─▶ qubeherd ──raw HID 0xB0/0xB1──▶ Qube dongle ──▶ screen
-~/.claude.json ──cachedUsageUtilization───────┘
+status line ──rate_limits─────────────────────┘
 ```
 
 [herdr](https://herdr.dev) tracks the state of every agent pane it manages.
@@ -41,6 +41,26 @@ no `L`/`R` letter. The two bars on top are the Claude Code limit windows, the
   `qubeherd --once`: it prints which node it picked.
 - **A running herdr server** — the socket defaults to
   `$HERDR_SOCKET_PATH`, falling back to `~/.config/herdr/herdr.sock`.
+- **A status line that harvests the limits**, for the two bars only. Claude
+  Code hands its status-line command the session JSON on every render; a
+  harvester writes the `rate_limits` object to
+  `$XDG_RUNTIME_DIR/claude-usage.json`, which is what this daemon reads. Claude
+  Code has exactly one status-line slot, so the harvesting belongs in whatever
+  script already owns it:
+
+  ```bash
+  jq -c '{five_hour:  .rate_limits.five_hour,
+         seven_day:  .rate_limits.seven_day,
+         written_at: (now | floor)}' <<<"$input" > "$tmp"
+  mv -f "$tmp" "${XDG_RUNTIME_DIR:-/tmp}/claude-usage.json"
+  ```
+
+  Write through a temporary file and rename, so a read never catches a half
+  written one, and skip the write when `rate_limits` is absent — it is missing
+  before a session's first API response and for accounts without a Pro or Max
+  subscription, and blanking the cache there would blank the bars on every
+  start. Without a harvester the daemon falls back to `~/.claude.json` and
+  flags what it finds as stale.
 
 ## Usage
 
@@ -63,7 +83,8 @@ $ nix run .                      # …or straight from the flake
 | `--once`          | push the current state once and exit                        |
 | `--no-clock`      | leave the header clock to Entropy                           |
 | `--no-usage`      | leave the Claude Code limit bars empty                       |
-| `--claude-config` | read the limits from this file instead of `~/.claude.json`   |
+| `--usage-harvest` | read the harvested limits from this file                     |
+| `--claude-config` | fallback config, when no status line has run yet             |
 | `--no-layout`     | do not sync the keyboard layout (Universal Symbols need it) |
 | `--verbose`       | log every packet                                            |
 
@@ -113,16 +134,22 @@ source lives on the desktop session bus.
   `hidraw2` and would silently flip the pick between replugs. A wired half
   attached alongside the dongle matches just as well, so several matches are
   logged as a warning — `--device` settles it.
-- **Reads the Claude Code limits off disk** (packet `0xB1`). Claude Code has no
-  command that reports them: the percentages arrive on
-  `anthropic-ratelimit-unified-*` response headers and the CLI caches them in
-  `~/.claude.json` under `cachedUsageUtilization`. That cache only refreshes
-  while a session is running, so a window whose own `resets_at` has passed is
-  reported as `0` rather than replayed — otherwise an afternoon away would
-  leave the screen advertising a limit that has since rolled over. An
-  unreadable file or window is sent as `0xFF` and draws `--`, never a
-  confident `0%`. The file is small (~90 KB), so it is simply reread on every
-  beat.
+- **Reads the Claude Code limits off disk** (packet `0xB1`), from the file the
+  status line harvests. Claude Code has no command that reports them and no
+  pollable endpoint — `/api/oauth/usage` answers 429 to anything that tries
+  ([claude-code#31637](https://github.com/anthropics/claude-code/issues/31637)).
+  What it does have is a status-line command that receives `rate_limits` on
+  every render, so that is where the numbers come from. `~/.claude.json` is
+  kept as a fallback for a machine where no session has rendered yet, and it is
+  marked stale on sight: its `cachedUsageUtilization` block only refreshes when
+  `/usage` is actually run.
+- **Says when a reading stopped moving.** The percentages only advance while a
+  local Claude Code session renders; usage spent in a browser or on another
+  machine never reaches this daemon. A harvest older than 30 minutes is sent
+  with the stale flag, and the screen dims the bars rather than dropping them.
+  A window whose own `resets_at` has passed is reported as `0` instead —
+  an empty window is a fact, not a guess. Genuinely unreadable goes out as
+  `0xFF` and draws `--`, never a confident `0%`.
 - **Sends the header clock too** (packet `0xAA`, on every minute rollover and
   after reopening the dongle). Entropy sends the same packet, but only while
   its GUI is running — without either, the header sits at `--:--`. Pass
@@ -177,6 +204,7 @@ The limit bars are their own packet:
 | 1    | protocol version (`0x01`)                       |
 | 2    | 5-hour window, percent used, `0xFF` if unknown  |
 | 3    | 7-day window, same encoding                     |
+| 4    | flags: bit 0 = nothing refreshed this lately     |
 
 The firmware swallows a packet whose version byte it does not know rather than
 misreading it, and keeps the unknown count without giving it a cell on screen.

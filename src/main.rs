@@ -73,7 +73,12 @@ struct Args {
     #[arg(long)]
     no_usage: bool,
 
-    /// Claude Code config to read the limits from
+    /// Limits harvested by the Claude Code status line
+    /// (default: $XDG_RUNTIME_DIR/claude-usage.json)
+    #[arg(long)]
+    usage_harvest: Option<PathBuf>,
+
+    /// Claude Code config, the fallback when no status line has run yet
     /// (default: $CLAUDE_CONFIG_DIR/.claude.json or ~/.claude.json)
     #[arg(long)]
     claude_config: Option<PathBuf>,
@@ -139,7 +144,7 @@ struct Bridge {
     wants_layout: bool,
     clock: bool,
     /// `None` when the limits are not being fed at all.
-    claude_config: Option<PathBuf>,
+    usage: Option<usage::Sources>,
     pushed: Pushed,
     notifier: notify::Notifier,
     /// Process-wide, so the numbers survive session restarts — which are
@@ -282,7 +287,7 @@ impl Bridge {
         // Same bargain for the limits, which move even slower: the file is
         // small enough to reread on every beat, and the packet only goes out
         // when a percentage moved or the firmware's expiry needs feeding.
-        let usage = self.claude_config.as_deref().map(usage::read);
+        let usage = self.usage.as_ref().map(usage::Sources::read);
         if let Some(usage) = usage {
             let changed = self.pushed.usage != Some(usage);
             let stale = self.pushed.usage_at.is_none_or(|at| at.elapsed() >= HEARTBEAT);
@@ -440,8 +445,13 @@ async fn run(args: Args) -> Result<()> {
         layouts,
         wants_layout: !args.no_layout,
         clock: !args.no_clock,
-        claude_config: (!args.no_usage)
-            .then(|| args.claude_config.clone().unwrap_or_else(usage::default_config_path)),
+        usage: (!args.no_usage).then(|| {
+            let defaults = usage::Sources::default();
+            usage::Sources {
+                harvest: args.usage_harvest.clone().unwrap_or(defaults.harvest),
+                config: args.claude_config.clone().unwrap_or(defaults.config),
+            }
+        }),
         pushed: Pushed::default(),
         notifier: notify::Notifier::from_env(),
         stats: Stats::default(),
