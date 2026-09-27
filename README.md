@@ -86,6 +86,8 @@ $ nix run .                      # …or straight from the flake
 | `--usage-harvest` | read the harvested limits from this file                     |
 | `--claude-config` | fallback config, when no status line has run yet             |
 | `--no-layout`     | do not sync the keyboard layout (Universal Symbols need it) |
+| `--no-battery`    | do not log the halves' battery levels                      |
+| `--battery-log`   | write the battery CSV here instead of the state dir         |
 | `--verbose`       | log every packet                                            |
 
 `RUST_LOG` is honoured on top of the flags, so detail can be raised on a
@@ -173,6 +175,16 @@ source lives on the desktop session bus.
   nothing on the firmware side expires either — so a reflash or a replug would
   otherwise leave Universal Symbols wrong until the next layout switch. The
   layout is also refreshed every 10 s as a backstop against a lost packet.
+- **Logs the halves' battery levels every 5 minutes**, to
+  `$XDG_STATE_HOME/qubeherd/battery.csv` (`time,left,right`), for watching how
+  fast they drain. The one request here that expects an answer: the dongle
+  already knows both levels, and the halves resample every 15 s on their own,
+  but each request also makes them resample and report over BLE — hence the
+  slow poll. A half the dongle has no reading from leaves its cell empty, so a
+  disconnect shows up as a gap rather than a repeated last value. The reply is
+  read on a reader opened just for it: hidraw drops new reports once a
+  reader's queue is full, and a long-lived one would fill with the dongle's
+  answers to every packet above.
 - **Says what it has been doing every 10 minutes.** A healthy daemon is
   otherwise silent, which makes silence useless as a signal: a spin, a freeze
   and an idle afternoon all read the same in the journal. The summary reports
@@ -216,3 +228,16 @@ Two packets predate this daemon and are reused as-is: `0xAA` (`[1]` hour,
 The firmware side lives in `rmk/src/host/via/mod.rs` (packet parsing),
 `rmk/src/host_data.rs` (the 30 s expiry, shared by both feeds) and
 `keyboards/k04/src/qube_display.rs` (the screen itself).
+
+The battery levels come back the other way, as the answer to a Via
+`CustomGetValue` in the Ergohaven namespace:
+
+| Byte | Request               | Reply                                   |
+| ---- | --------------------- | --------------------------------------- |
+| 0    | `0x08`                | `0x08`                                  |
+| 1    | `0xE8` — Ergohaven    | `0xE8`                                  |
+| 2    | `0x01` — halves       | `0x01`                                  |
+| 3    |                       | reply version (`0x01`)                  |
+| 4    |                       | bit 0 = left known, bit 1 = right known |
+| 5    |                       | left half, percent                      |
+| 6    |                       | right half, percent                     |

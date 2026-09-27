@@ -1,10 +1,13 @@
 //! Raw-HID transport to the Qube dongle.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read as _, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::io::unix::AsyncFd;
 
 /// Packet types, mirrored in `rmk/src/host/via/mod.rs`.
 const PACKET_AGENTS: u8 = 0xB0;
@@ -18,6 +21,15 @@ const PACKET_USAGE_FLAG_STALE: u8 = 0x01;
 const PACKET_CLOCK: u8 = 0xAA;
 const PACKET_LAYOUT: u8 = 0xAC;
 const PACKET_LEN: usize = 32;
+
+/// Via `CustomGetValue` in the Ergohaven namespace, asking for the halves'
+/// battery levels; answered by `ERGOHAVEN_CUSTOM_BATTERY_HALVES` in the firmware.
+const BATTERY_REQUEST: [u8; 3] = [0x08, 0xE8, 0x01];
+const BATTERY_REPLY_VERSION: u8 = 0x01;
+/// The dongle answers from RAM within milliseconds; this only bounds a wedged one.
+const BATTERY_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+/// `O_NONBLOCK` on Linux, spelled out rather than pulling in `libc` for one flag.
+const O_NONBLOCK: i32 = 0o4000;
 
 /// Ergohaven vendor id; the dongle and the wired halves share it.
 const HID_VENDOR_ID: u16 = 0xE126;
@@ -61,6 +73,21 @@ pub fn layout_packet(code: u8) -> [u8; PACKET_LEN] {
     payload[0] = PACKET_LAYOUT;
     payload[1] = code;
     payload
+}
+
+/// Battery levels of the two halves, in percent; `None` for a half the dongle
+/// has no reading from — disconnected, or not reported since it booted.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Halves {
+    pub left: Option<u8>,
+    pub right: Option<u8>,
+}
+
+impl std::fmt::Display for Halves {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let show = |level: Option<u8>| level.map_or("--".to_string(), |level| format!("{level}%"));
+        write!(f, "left {}, right {}", show(self.left), show(self.right))
+    }
 }
 
 /// The dongle's raw-HID node, reopened across unplug/replug.
@@ -134,6 +161,50 @@ impl Qube {
         self.writes += 1;
         log::debug!("sent {:02x?}", &payload[..7]);
         Ok(())
+    }
+
+    /// Asks the dongle for the halves' battery levels.
+    ///
+    /// The only packet here that expects an answer. The reply comes back on a
+    /// reader opened just for it: hidraw hands every input report to every open
+    /// reader and drops new ones once a reader's queue is full, so one kept open
+    /// would fill with the dongle's answers to the packets above and then lose
+    /// exactly the reply it was waiting for. A fresh reader starts empty, and
+    /// the header match skips an answer meant for Entropy on the same node.
+    pub async fn battery_halves(&mut self) -> Result<Halves> {
+        let path = self.path.clone().context("device is not open")?;
+        let reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+            .with_context(|| format!("opening {} for reading", path.display()))?;
+        let reader = AsyncFd::new(reader).context("registering the reader")?;
+
+        let mut request = [0u8; PACKET_LEN];
+        request[..BATTERY_REQUEST.len()].copy_from_slice(&BATTERY_REQUEST);
+        self.write(&request)?;
+
+        let reply = async {
+            loop {
+                let mut ready = reader.readable().await?;
+                let mut report = [0u8; PACKET_LEN];
+                let Ok(read) = ready.try_io(|fd| fd.get_ref().read(&mut report)) else {
+                    continue;
+                };
+                let read = read?;
+                if read >= 7 && report[..3] == BATTERY_REQUEST && report[3] == BATTERY_REPLY_VERSION {
+                    let flags = report[4];
+                    return std::io::Result::Ok(Halves {
+                        left: (flags & 0x01 != 0).then_some(report[5]),
+                        right: (flags & 0x02 != 0).then_some(report[6]),
+                    });
+                }
+            }
+        };
+        tokio::time::timeout(BATTERY_REPLY_TIMEOUT, reply)
+            .await
+            .context("the dongle did not answer the battery request")?
+            .context("reading the battery reply")
     }
 
     pub fn close(&mut self) {

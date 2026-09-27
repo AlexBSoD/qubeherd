@@ -7,7 +7,9 @@
 //! header clock and — more importantly — the active keyboard layout, which
 //! Universal Symbols need to pick the right keycodes. The screen also shows
 //! how much of the Claude Code limits is spent, read from the CLI's own cache.
+//! Going the other way, it logs the halves' battery levels to a CSV file.
 
+mod battery;
 mod herdr;
 mod layout;
 mod notify;
@@ -45,6 +47,10 @@ const LAYOUT_PROBE: Duration = Duration::from_secs(30);
 /// signal: a spin, a freeze and an idle afternoon all read the same in the
 /// journal. Rates make them tell themselves apart.
 const SUMMARY: Duration = Duration::from_secs(600);
+/// How often to log the halves' battery levels. The halves resample every 15 s
+/// on their own, but a percent moves over hours; each poll also costs the
+/// halves a BLE round trip, so this is as slow as a drain curve allows.
+const BATTERY_POLL: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -82,6 +88,15 @@ struct Args {
     /// (default: $CLAUDE_CONFIG_DIR/.claude.json or ~/.claude.json)
     #[arg(long)]
     claude_config: Option<PathBuf>,
+
+    /// Do not log the halves' battery levels
+    #[arg(long)]
+    no_battery: bool,
+
+    /// Where the battery levels go
+    /// (default: $XDG_STATE_HOME/qubeherd/battery.csv)
+    #[arg(long)]
+    battery_log: Option<PathBuf>,
 
     /// Log every packet
     #[arg(long)]
@@ -145,6 +160,10 @@ struct Bridge {
     clock: bool,
     /// `None` when the limits are not being fed at all.
     usage: Option<usage::Sources>,
+    /// `None` when the battery levels are not being logged.
+    battery: Option<battery::Log>,
+    /// Kept across sessions, so a session restart does not add a row.
+    next_battery: Instant,
     pushed: Pushed,
     notifier: notify::Notifier,
     /// Process-wide, so the numbers survive session restarts — which are
@@ -218,6 +237,24 @@ impl Bridge {
             self.resync_after_open().await?;
         }
         Ok(())
+    }
+
+    /// Logs one battery row. Never fails the session: a dongle that is gone is
+    /// the beat's business, and here it is just a row with both cells empty.
+    async fn log_battery(&mut self) {
+        let halves = match self.ensure_ready().await {
+            Ok(()) => self.qube.battery_halves().await,
+            Err(err) => Err(err),
+        };
+        let halves = halves.unwrap_or_else(|err| {
+            log::warn!("battery: {err:#}");
+            qube::Halves::default()
+        });
+        if let Some(log) = self.battery.as_mut() {
+            if let Err(err) = log.append(halves) {
+                log::warn!("battery: {err:#}");
+            }
+        }
     }
 
     async fn push_layout(&mut self, code: u8) -> Result<()> {
@@ -401,6 +438,10 @@ async fn session(bridge: &mut Bridge) -> Result<()> {
             _ = sleep_until(bridge.next_summary) => {
                 bridge.log_summary();
             }
+            _ = sleep_until(bridge.next_battery), if bridge.battery.is_some() => {
+                bridge.next_battery = Instant::now() + BATTERY_POLL;
+                bridge.log_battery().await;
+            }
             result = events.next() => {
                 result?;
                 bridge.stats.events += 1;
@@ -452,6 +493,10 @@ async fn run(args: Args) -> Result<()> {
                 config: args.claude_config.clone().unwrap_or(defaults.config),
             }
         }),
+        battery: (!args.no_battery).then(|| {
+            battery::Log::new(args.battery_log.clone().unwrap_or_else(battery::Log::default_path))
+        }),
+        next_battery: Instant::now(),
         pushed: Pushed::default(),
         notifier: notify::Notifier::from_env(),
         stats: Stats::default(),
