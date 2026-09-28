@@ -176,9 +176,14 @@ source lives on the desktop session bus.
   otherwise leave Universal Symbols wrong until the next layout switch. The
   layout is also refreshed every 10 s as a backstop against a lost packet.
 - **Logs the halves' battery levels every 5 minutes**, to
-  `$XDG_STATE_HOME/qubeherd/battery.csv` (`time,left,right`), for watching how
-  fast they drain. The one request here that expects an answer: the dongle
-  already knows both levels, and the halves resample every 15 s on their own,
+  `$XDG_STATE_HOME/qubeherd/battery.csv` (`time,left,right`, then each half's
+  `wakes,awake_min,up_min`), for watching how fast they drain and whether a
+  half actually sleeps. The sleep columns come from the `diag/k04-sleep-stats`
+  firmware, count since the half booted and lag one poll behind; they stay
+  empty on other firmware. A log written with other columns is renamed to
+  `battery-until-<date>.csv` first. The one request here that expects an
+  answer: the dongle already knows both levels, and the halves resample every
+  15 s on their own,
   but each request also makes them resample and report over BLE — hence the
   slow poll. A half the dongle has no reading from leaves its cell empty, so a
   disconnect shows up as a gap rather than a repeated last value. The reply is
@@ -238,6 +243,8 @@ The battery levels come back the other way, as the answer to a Via
 | 1    | `0xE8` — Ergohaven    | `0xE8`                                  |
 | 2    | `0x01` — halves       | `0x01`                                  |
 | 3    |                       | reply version (`0x01`)                  |
-| 4    |                       | bit 0 = left known, bit 1 = right known |
+| 4    |                       | bit 0/1 = left/right level known, bit 2/3 = left/right sleep stats known |
 | 5    |                       | left half, percent                      |
 | 6    |                       | right half, percent                     |
+| 7–12 |                       | left: wake-ups, awake min, uptime min (u16 LE each) |
+| 13–18 |                      | right: same                             |

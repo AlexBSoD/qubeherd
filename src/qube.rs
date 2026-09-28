@@ -81,6 +81,29 @@ pub fn layout_packet(code: u8) -> [u8; PACKET_LEN] {
 pub struct Halves {
     pub left: Option<u8>,
     pub right: Option<u8>,
+    pub left_sleep: Option<SleepStats>,
+    pub right_sleep: Option<SleepStats>,
+}
+
+/// How a half has slept since it booted, as last reported to the dongle; only
+/// firmware with the sleep-stats diagnostic sends it. Lags one poll behind:
+/// the half answers the refresh this request triggers after the reply is out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SleepStats {
+    pub wakes: u16,
+    pub awake_min: u16,
+    pub uptime_min: u16,
+}
+
+impl SleepStats {
+    fn parse(fields: &[u8]) -> Self {
+        let word = |i: usize| u16::from_le_bytes([fields[i], fields[i + 1]]);
+        Self {
+            wakes: word(0),
+            awake_min: word(2),
+            uptime_min: word(4),
+        }
+    }
 }
 
 impl std::fmt::Display for Halves {
@@ -194,9 +217,12 @@ impl Qube {
                 let read = read?;
                 if read >= 7 && report[..3] == BATTERY_REQUEST && report[3] == BATTERY_REPLY_VERSION {
                     let flags = report[4];
+                    let has_sleep = |flag: u8| read >= 19 && flags & flag != 0;
                     return std::io::Result::Ok(Halves {
                         left: (flags & 0x01 != 0).then_some(report[5]),
                         right: (flags & 0x02 != 0).then_some(report[6]),
+                        left_sleep: has_sleep(0x04).then(|| SleepStats::parse(&report[7..13])),
+                        right_sleep: has_sleep(0x08).then(|| SleepStats::parse(&report[13..19])),
                     });
                 }
             }
