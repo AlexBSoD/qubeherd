@@ -1,9 +1,10 @@
 //! A CSV log of the halves' battery levels, for watching how fast they drain.
 //!
 //! One row per poll — time, left %, right %, then each half's sleep statistics
-//! (wake-ups, awake minutes, uptime minutes) — with empty cells for a half the
-//! dongle had no reading from, so a disconnect shows up as a gap rather than as
-//! a repeated last value.
+//! (wake-ups, awake minutes, uptime minutes), then each half's pointing sensor
+//! loop passes and motion reads — with empty cells for a half the dongle had no
+//! reading from, so a disconnect shows up as a gap rather than as a repeated
+//! last value.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -11,10 +12,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::qube::{Halves, SleepStats};
+use crate::qube::{Halves, PointingStats, SleepStats};
 
-const HEADER: &str =
-    "time,left,right,left_wakes,left_awake_min,left_up_min,right_wakes,right_awake_min,right_up_min";
+const HEADER: &str = concat!(
+    "time,left,right,left_wakes,left_awake_min,left_up_min,right_wakes,right_awake_min,right_up_min,",
+    "left_pt_wakes,left_pt_reads,right_pt_wakes,right_pt_reads"
+);
 
 pub struct Log {
     path: PathBuf,
@@ -58,12 +61,14 @@ impl Log {
         }
         writeln!(
             file,
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
             level_cell(halves.left),
             level_cell(halves.right),
             sleep_cells(halves.left_sleep),
             sleep_cells(halves.right_sleep),
+            pointing_cells(halves.left_pointing),
+            pointing_cells(halves.right_pointing),
         )
         .with_context(|| format!("writing {}", self.path.display()))
     }
@@ -78,6 +83,10 @@ fn sleep_cells(stats: Option<SleepStats>) -> String {
         || ",,".to_string(),
         |stats| format!("{},{},{}", stats.wakes, stats.awake_min, stats.uptime_min),
     )
+}
+
+fn pointing_cells(stats: Option<PointingStats>) -> String {
+    stats.map_or_else(|| ",".to_string(), |stats| format!("{},{}", stats.wakes, stats.reads))
 }
 
 /// Renames a log written with other columns to `battery-until-<date>.csv`, so
@@ -109,6 +118,13 @@ mod tests {
             uptime_min: 600,
         };
         assert_eq!(sleep_cells(Some(stats)), "3,41,600");
+    }
+
+    #[test]
+    fn pointing_cells_leave_a_gap_for_a_half_without_stats() {
+        assert_eq!(pointing_cells(None), ",");
+        let stats = PointingStats { wakes: 120, reads: 340 };
+        assert_eq!(pointing_cells(Some(stats)), "120,340");
     }
 
     #[test]

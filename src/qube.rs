@@ -83,6 +83,8 @@ pub struct Halves {
     pub right: Option<u8>,
     pub left_sleep: Option<SleepStats>,
     pub right_sleep: Option<SleepStats>,
+    pub left_pointing: Option<PointingStats>,
+    pub right_pointing: Option<PointingStats>,
 }
 
 /// How a half has slept since it booted, as last reported to the dongle; only
@@ -102,6 +104,25 @@ impl SleepStats {
             wakes: word(0),
             awake_min: word(2),
             uptime_min: word(4),
+        }
+    }
+}
+
+/// How busy a half's pointing sensor loop has been since it booted: loop
+/// passes and motion reads, each the low 24 bits of a wrapping counter, so
+/// compare consecutive rows modulo 2^24. Same lag as [`SleepStats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointingStats {
+    pub wakes: u32,
+    pub reads: u32,
+}
+
+impl PointingStats {
+    fn parse(fields: &[u8]) -> Self {
+        let u24 = |i: usize| u32::from_le_bytes([fields[i], fields[i + 1], fields[i + 2], 0]);
+        Self {
+            wakes: u24(0),
+            reads: u24(3),
         }
     }
 }
@@ -218,11 +239,14 @@ impl Qube {
                 if read >= 7 && report[..3] == BATTERY_REQUEST && report[3] == BATTERY_REPLY_VERSION {
                     let flags = report[4];
                     let has_sleep = |flag: u8| read >= 19 && flags & flag != 0;
+                    let has_pointing = |flag: u8| read >= 31 && flags & flag != 0;
                     return std::io::Result::Ok(Halves {
                         left: (flags & 0x01 != 0).then_some(report[5]),
                         right: (flags & 0x02 != 0).then_some(report[6]),
                         left_sleep: has_sleep(0x04).then(|| SleepStats::parse(&report[7..13])),
                         right_sleep: has_sleep(0x08).then(|| SleepStats::parse(&report[13..19])),
+                        left_pointing: has_pointing(0x10).then(|| PointingStats::parse(&report[19..25])),
+                        right_pointing: has_pointing(0x20).then(|| PointingStats::parse(&report[25..31])),
                     });
                 }
             }
@@ -305,4 +329,21 @@ fn candidate(entry: &Path) -> Option<Candidate> {
             .unwrap_or("unnamed")
             .to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointing_stats_are_little_endian_u24_pairs() {
+        let fields = [0x01, 0x02, 0x03, 0xff, 0x00, 0x10];
+        assert_eq!(
+            PointingStats::parse(&fields),
+            PointingStats {
+                wakes: 0x03_0201,
+                reads: 0x10_00ff,
+            }
+        );
+    }
 }
